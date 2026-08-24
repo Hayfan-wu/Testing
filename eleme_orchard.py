@@ -84,14 +84,104 @@ class MtopClient:
         # 设置cookie到session
         self.session.headers["Cookie"] = self.cookie_str
 
-    def _init_token(self):
-        """从_m_h5_tk cookie中提取token, 若无则通过一次请求获取"""
-        h5_tk = self.cookies.get("_m_h5_tk", "")
-        if h5_tk:
-            self.token = h5_tk.split("_")[0]
+    def _refresh_token(self):
+        """
+        发送预请求刷新 _m_h5_tk 和 _m_h5_tk_enc。
+        _m_h5_tk 有效期仅15~22分钟，且必须与 _m_h5_tk_enc 配对使用。
+        每次脚本启动时必须执行一次预请求。
+        """
+        log("正在刷新 MTOP token (_m_h5_tk + _m_h5_tk_enc)...")
+
+        # 构造不带 _m_h5_tk / _m_h5_tk_enc 的临时cookie，触发服务端下发新token
+        temp_cookies = {
+            k: v for k, v in self.cookies.items()
+            if k not in ("_m_h5_tk", "_m_h5_tk_enc")
+        }
+        temp_cookie_str = "; ".join(f"{k}={v}" for k, v in temp_cookies.items())
+
+        timestamp = str(int(time.time() * 1000))
+        data_str = json.dumps({"bizScene": BIZ_SCENE_ORCHARD}, separators=(",", ":"), ensure_ascii=False)
+        # 空token时的签名: md5("&" + t + "&" + appKey + "&" + data)
+        sign_raw = f"&{timestamp}&{APP_KEY}&{data_str}"
+        sign = hashlib.md5(sign_raw.encode("utf-8")).hexdigest()
+
+        params = {
+            "jsv": "2.7.0",
+            "appKey": APP_KEY,
+            "t": timestamp,
+            "sign": sign,
+            "api": "mtop.alsc.playgame.orchard.base.info.query",
+            "v": "1.0",
+            "type": "originaljson",
+            "dataType": "json",
+            "data": data_str,
+        }
+        url = f"{MTOP_HOST}/h5/mtop.alsc.playgame.orchard.base.info.query/1.0/"
+
+        headers = dict(self.session.headers)
+        headers["Cookie"] = temp_cookie_str
+
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
+        except Exception as e:
+            log(f"预请求刷新token失败: {e}", "ERROR")
+            return False
+
+        # 提取 _m_h5_tk 和 _m_h5_tk_enc
+        new_tk = resp.cookies.get("_m_h5_tk")
+        new_tk_enc = resp.cookies.get("_m_h5_tk_enc")
+
+        # 备用: 从原始响应头解析
+        if not new_tk or not new_tk_enc:
+            raw_set_cookies = []
+            if hasattr(resp, "raw") and resp.raw and hasattr(resp.raw, "_original_response"):
+                try:
+                    raw_set_cookies = resp.raw._original_response.headers.get_all("Set-Cookie") or []
+                except Exception:
+                    pass
+            if not raw_set_cookies:
+                raw_set_cookies = [v for k, v in resp.headers.items() if k.lower() == "set-cookie"]
+
+            for sc in raw_set_cookies:
+                for part in sc.split(","):
+                    part = part.strip()
+                    if part.startswith("_m_h5_tk=") and not new_tk:
+                        new_tk = part.split("_m_h5_tk=")[1].split(";")[0]
+                    if part.startswith("_m_h5_tk_enc=") and not new_tk_enc:
+                        new_tk_enc = part.split("_m_h5_tk_enc=")[1].split(";")[0]
+
+        if new_tk and new_tk_enc:
+            self.cookies["_m_h5_tk"] = new_tk
+            self.cookies["_m_h5_tk_enc"] = new_tk_enc
+            self.token = new_tk.split("_")[0]
+            self.cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+            self.session.headers["Cookie"] = self.cookie_str
+            log(f"Token刷新成功! _m_h5_tk={new_tk[:20]}..., _m_h5_tk_enc={new_tk_enc[:20]}...")
+            return True
         else:
-            self.token = ""
-        self.token_ts = h5_tk.split("_")[-1] if "_" in h5_tk else ""
+            log(f"预请求未返回完整的token! _m_h5_tk={'有' if new_tk else '无'}, _m_h5_tk_enc={'有' if new_tk_enc else '无'}", "ERROR")
+            # 如果只有 _m_h5_tk 没有 _m_h5_tk_enc，也先凑合用
+            if new_tk:
+                self.cookies["_m_h5_tk"] = new_tk
+                self.token = new_tk.split("_")[0]
+                self.cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+                self.session.headers["Cookie"] = self.cookie_str
+            return False
+
+    def _init_token(self):
+        """初始化token: 总是先预请求刷新 _m_h5_tk + _m_h5_tk_enc"""
+        h5_tk = self.cookies.get("_m_h5_tk", "")
+        h5_tk_enc = self.cookies.get("_m_h5_tk_enc", "")
+
+        # 只要缺少任一token，或token已存在但可能过期，都执行预请求刷新
+        # (用户提供的token几乎肯定已过期，因为有效期只有15~22分钟)
+        if not h5_tk or not h5_tk_enc:
+            log("Cookie中缺少 _m_h5_tk 或 _m_h5_tk_enc，执行预请求获取...")
+            self._refresh_token()
+        else:
+            # 即使cookie中都有，也刷新一次确保未过期
+            log("执行预请求刷新token(有效期仅15~22分钟)...")
+            self._refresh_token()
 
     def _sign(self, timestamp, data_str):
         """计算MTOP签名: md5(token + & + timestamp + & + appKey + & + data)"""
@@ -141,31 +231,9 @@ class MtopClient:
             # 处理token未初始化/过期的情况 (FAIL_SYS_TOKEN_EXOIRED / FAIL_SYS_TOKEN_EMPTY 等)
             ret_str = "".join(result.get("ret", []))
             if "TOKEN" in ret_str.upper() or "SESSION" in ret_str.upper():
-                # 优先从 resp.cookies 取 _m_h5_tk (RequestsCookieJar.get()直接取值)
-                tk_val = resp.cookies.get("_m_h5_tk")
-                # 备用: 从响应头的多个Set-Cookie中解析
-                if not tk_val:
-                    raw_set_cookie = resp.raw._original_response.headers.get_all("Set-Cookie") if hasattr(resp, "raw") else []
-                    if not raw_set_cookie:
-                        raw_set_cookie = [v for k, v in resp.headers.items() if k.lower() == "set-cookie"]
-                    for sc in raw_set_cookie:
-                        for part in sc.split(","):
-                            part = part.strip()
-                            if part.startswith("_m_h5_tk="):
-                                tk_val = part.split("_m_h5_tk=")[1].split(";")[0]
-                                break
-                        if tk_val:
-                            break
-
-                if tk_val:
-                    log(f"获取到新的 _m_h5_tk: {tk_val[:20]}...")
-                    self.cookies["_m_h5_tk"] = tk_val
-                    self.token = tk_val.split("_")[0]
-                    self.cookie_str = "; ".join(
-                        f"{k}={v}" for k, v in self.cookies.items()
-                    )
-                    self.session.headers["Cookie"] = self.cookie_str
-                    # 重试请求 (使用新token重新计算签名)
+                log(f"收到Token错误: {ret_str}, 尝试刷新token...")
+                if self._refresh_token():
+                    # 使用新token重试请求
                     timestamp = str(int(time.time() * 1000))
                     params["t"] = timestamp
                     params["sign"] = self._sign(timestamp, data_str)
@@ -179,7 +247,7 @@ class MtopClient:
                     result = resp.json()
                     return result
                 else:
-                    log("响应中未找到 _m_h5_tk, 无法自动刷新token", "ERROR")
+                    log("Token刷新失败，请检查Cookie是否有效", "ERROR")
 
             return result
 
@@ -188,13 +256,19 @@ class MtopClient:
 
     # ============ 果园API封装 ============
 
-    def query_base_info(self):
+    def query_base_info(self, lat=DEFAULT_LAT, lng=DEFAULT_LNG, city_id=DEFAULT_CITY):
         """查询果园基础信息"""
         return self.request(
             "mtop.alsc.playgame.orchard.base.info.query",
             "1.0",
-            {"bizScene": BIZ_SCENE_ORCHARD},
+            {
+                "bizScene": BIZ_SCENE_ORCHARD,
+                "latitude": lat,
+                "longitude": lng,
+                "cityId": city_id,
+            },
             method="GET",
+            auth=True,
         )
 
     def query_future_water(self):
@@ -242,32 +316,47 @@ class MtopClient:
             auth=True,
         )
 
-    def query_sign_info(self):
+    def query_sign_info(self, lat=DEFAULT_LAT, lng=DEFAULT_LNG, city_id=DEFAULT_CITY):
         """查询签到信息"""
         return self.request(
             "mtop.koubei.interactioncenter.orchard.sign.querySignInfo",
             "1.0",
-            {},
+            {
+                "bizScene": BIZ_SCENE_ORCHARD,
+                "latitude": lat,
+                "longitude": lng,
+                "cityId": city_id,
+            },
             method="GET",
             auth=True,
         )
 
-    def record_signin(self):
+    def record_signin(self, lat=DEFAULT_LAT, lng=DEFAULT_LNG, city_id=DEFAULT_CITY):
         """执行签到"""
         return self.request(
             "mtop.koubei.interactioncenter.orchard.sign.recordSignIn",
             "1.0",
-            {},
+            {
+                "bizScene": BIZ_SCENE_ORCHARD,
+                "latitude": lat,
+                "longitude": lng,
+                "cityId": city_id,
+            },
             method="POST",
             auth=True,
         )
 
-    def receive_signin_award(self):
+    def receive_signin_award(self, lat=DEFAULT_LAT, lng=DEFAULT_LNG, city_id=DEFAULT_CITY):
         """领取签到奖励"""
         return self.request(
             "mtop.koubei.interactioncenter.orchard.sign.receiveSignInAward",
             "1.1",
-            {},
+            {
+                "bizScene": BIZ_SCENE_ORCHARD,
+                "latitude": lat,
+                "longitude": lng,
+                "cityId": city_id,
+            },
             method="POST",
             auth=True,
         )
@@ -490,12 +579,20 @@ class OrchardBot:
     def get_base_info(self):
         """获取果园基础信息"""
         log("正在获取果园基础信息...")
-        result = self.client.query_base_info()
+        result = self.client.query_base_info(
+            lat=self.city_info["lat"],
+            lng=self.city_info["lng"],
+            city_id=self.city_info["city_id"],
+        )
         if not self._stop_on_error(result, "获取果园信息"):
             return False
 
         data = get_api_data(result)
         self.base_info = data
+
+        # DEBUG: 打印原始响应的前500字符，便于排查数据结构问题
+        raw_json = json.dumps(result, ensure_ascii=False)
+        log(f"DEBUG 基础信息响应: {raw_json[:500]}")
 
         # 提取关键信息
         # 蜗牛(snail)信息
@@ -534,7 +631,11 @@ class OrchardBot:
         log("=== 开始每日签到 ===")
 
         # 1. 查询签到信息
-        result = self.client.query_sign_info()
+        result = self.client.query_sign_info(
+            lat=self.city_info["lat"],
+            lng=self.city_info["lng"],
+            city_id=self.city_info["city_id"],
+        )
         if check_api_success(result):
             data = get_api_data(result)
             signed = data.get("hasSigned", False) or data.get("isSigned", False)
@@ -543,7 +644,11 @@ class OrchardBot:
             else:
                 log("今日未签到, 正在签到...")
                 # 2. 执行签到
-                result = self.client.record_signin()
+                result = self.client.record_signin(
+                    lat=self.city_info["lat"],
+                    lng=self.city_info["lng"],
+                    city_id=self.city_info["city_id"],
+                )
                 if check_api_success(result):
                     log("签到成功!")
                 else:
@@ -553,7 +658,11 @@ class OrchardBot:
                 time.sleep(1)
 
                 # 3. 领取签到奖励
-                result = self.client.receive_signin_award()
+                result = self.client.receive_signin_award(
+                    lat=self.city_info["lat"],
+                    lng=self.city_info["lng"],
+                    city_id=self.city_info["city_id"],
+                )
                 if check_api_success(result):
                     data = get_api_data(result)
                     reward = data.get("rewardAmount", data.get("waterAmount", "未知"))
