@@ -138,35 +138,48 @@ class MtopClient:
 
             result = resp.json()
 
-            # 处理token未初始化的情况 (FAIL_SYS_TOKEN_EXOIRED 或类似)
+            # 处理token未初始化/过期的情况 (FAIL_SYS_TOKEN_EXOIRED / FAIL_SYS_TOKEN_EMPTY 等)
             ret_str = "".join(result.get("ret", []))
             if "TOKEN" in ret_str.upper() or "SESSION" in ret_str.upper():
-                # 更新cookie中的_m_h5_tk (从Set-Cookie头)
-                new_cookies = resp.headers.get("Set-Cookie", "")
-                if "_m_h5_tk" in new_cookies:
-                    for item in new_cookies.split(","):
-                        item = item.strip()
-                        if item.startswith("_m_h5_tk="):
-                            tk_val = item.split("_m_h5_tk=")[1].split(";")[0]
-                            self.cookies["_m_h5_tk"] = tk_val
-                            self.token = tk_val.split("_")[0]
-                            self.cookie_str = "; ".join(
-                                f"{k}={v}" for k, v in self.cookies.items()
-                            )
-                            self.session.headers["Cookie"] = self.cookie_str
-                            # 重试请求
-                            timestamp = str(int(time.time() * 1000))
-                            params["t"] = timestamp
-                            params["sign"] = self._sign(timestamp, data_str)
-                            if method.upper() == "GET":
-                                params["data"] = data_str
-                                resp = self.session.get(url, params=params, timeout=15)
-                            else:
-                                resp = self.session.post(
-                                    url, params=params, data={"data": data_str}, timeout=15
-                                )
-                            result = resp.json()
+                # 优先从 resp.cookies 取 _m_h5_tk (RequestsCookieJar.get()直接取值)
+                tk_val = resp.cookies.get("_m_h5_tk")
+                # 备用: 从响应头的多个Set-Cookie中解析
+                if not tk_val:
+                    raw_set_cookie = resp.raw._original_response.headers.get_all("Set-Cookie") if hasattr(resp, "raw") else []
+                    if not raw_set_cookie:
+                        raw_set_cookie = [v for k, v in resp.headers.items() if k.lower() == "set-cookie"]
+                    for sc in raw_set_cookie:
+                        for part in sc.split(","):
+                            part = part.strip()
+                            if part.startswith("_m_h5_tk="):
+                                tk_val = part.split("_m_h5_tk=")[1].split(";")[0]
+                                break
+                        if tk_val:
+                            break
+
+                if tk_val:
+                    log(f"获取到新的 _m_h5_tk: {tk_val[:20]}...")
+                    self.cookies["_m_h5_tk"] = tk_val
+                    self.token = tk_val.split("_")[0]
+                    self.cookie_str = "; ".join(
+                        f"{k}={v}" for k, v in self.cookies.items()
+                    )
+                    self.session.headers["Cookie"] = self.cookie_str
+                    # 重试请求 (使用新token重新计算签名)
+                    timestamp = str(int(time.time() * 1000))
+                    params["t"] = timestamp
+                    params["sign"] = self._sign(timestamp, data_str)
+                    if method.upper() == "GET":
+                        params["data"] = data_str
+                        resp = self.session.get(url, params=params, timeout=15)
+                    else:
+                        resp = self.session.post(
+                            url, params=params, data={"data": data_str}, timeout=15
+                        )
+                    result = resp.json()
                     return result
+                else:
+                    log("响应中未找到 _m_h5_tk, 无法自动刷新token", "ERROR")
 
             return result
 
