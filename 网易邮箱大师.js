@@ -13,17 +13,6 @@
  *     集赞进度由原生桥打开小红书后服务端内部推进, 无HTTP API可替代
  *   - 修复集赞领奖: 使用 collectLikeReward() → POST /task/reward {taskType:"COLLECT_LIKE"}
  * 
- * v5.0 更新:
- *   - 新增: 自动完成interaction类型任务(点赞/集赞子任务)
- *   - 新增: 视频广告状态轮询检测
- *   - 新增: 集赞任务进度展示
- * 
- * v4.0 核心突破:
- *   - 发现任务完成的关键: 必须带 token 参数!
- *   - 完整流程: /task/complete {taskSpeType, token} → Todo变Award
- *              /task/reward  {taskSpeType, token} → Award变Done + 发放积分
- *   - 实测积分从83涨到308 (+225分), 成功领取16个任务奖励!
- * 
  * 任务完成机制:
  *   ✅ simpleJudge=true 任务: /task/complete + /task/reward (带token)
  *   ✅ interaction任务(点赞子任务): 同上, 完成后标记Done并发放积分
