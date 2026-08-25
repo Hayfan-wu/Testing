@@ -3,6 +3,13 @@
  * 
  * 逆向分析自: mail.apk (Mail Master v7.25.19, com.netease.mail)
  * 
+ * v6.1.0 更新:
+ *   - 修复无token任务跳过问题: daily任务先 /task/claim 获取token再完成
+ *   - 逆向发现: button.operation.route.type==="claim" 的任务(Init状态无token)
+ *     需先调用 POST /task/claim {taskSpeType} (不带token) → Init变Todo+生成token
+ *     然后走标准 complete + reward 流程
+ *   - 实测: 查看邮件/归档/标待办/规划任务共4个, 各5积分 = +20积分
+ * 
  * v6.0 更新:
  *   - 深度逆向前端JS (task-center/index.9b0d5fca.js) 和 dex (classes.dex)
  *   - 发现集赞任务使用 taskType:"COLLECT_LIKE" (非taskSpeType)
@@ -13,8 +20,21 @@
  *     集赞进度由原生桥打开小红书后服务端内部推进, 无HTTP API可替代
  *   - 修复集赞领奖: 使用 collectLikeReward() → POST /task/reward {taskType:"COLLECT_LIKE"}
  * 
+ * v5.0 更新:
+ *   - 新增: 自动完成interaction类型任务(点赞/集赞子任务)
+ *   - 新增: 视频广告状态轮询检测
+ *   - 新增: 集赞任务进度展示
+ * 
+ * v4.0 核心突破:
+ *   - 发现任务完成的关键: 必须带 token 参数!
+ *   - 完整流程: /task/complete {taskSpeType, token} → Todo变Award
+ *              /task/reward  {taskSpeType, token} → Award变Done + 发放积分
+ *   - 实测积分从83涨到308 (+225分), 成功领取16个任务奖励!
+ * 
  * 任务完成机制:
- *   ✅ simpleJudge=true 任务: /task/complete + /task/reward (带token)
+ *   ✅ simpleJudge=true 任务(有token): /task/complete + /task/reward (带token)
+ *   ✅ daily任务(无token, Init状态): /task/claim → 获取token → complete + reward
+ *      适用于: 查看邮件/归档/标待办/规划任务 (button.operation.route.type==="claim")
  *   ✅ interaction任务(点赞子任务): 同上, 完成后标记Done并发放积分
  *   ✅ 签到: /task/complete (无需token)
  *   ⚠️ 视频广告: simpleJudge=false, 需穿山甲SDK S2S回调, needAutoReward=true自动发奖
@@ -42,7 +62,7 @@ const crypto = require('crypto');
 // ============ 配置 ============
 const TASK_CENTER_BASE = 'https://dashi.163.com/task-center-api/fapi';
 const MAIL_SCORE_BASE = 'https://dashi.163.com/mailsrv-score/fapi';
-const SCRIPT_VERSION = '6.0.0';
+const SCRIPT_VERSION = '6.1.0';
 const SCRIPT_NAME = '网易邮箱大师邮积分';
 
 // ============ 通知 ============
@@ -192,12 +212,21 @@ class MailPointsClient {
   }
 
   /**
-   * 认领任务 (dex逆向发现)
-   * POST /task/claim { taskSpeType, token }
-   * 返回 200 DONE (但集赞进度未推进, 需原生桥OPERATE_POINTS_CENTER_TASK)
+   * 认领任务 (逆向发现: 无token任务的初始化步骤)
+   * 
+   * 用途1 - daily任务初始化 (无token):
+   *   POST /task/claim { taskSpeType }  (无需token)
+   *   Init → Todo + 服务端生成token返回
+   *   适用于: 查看邮件/归档邮件/标待办/规划任务等 button.operation.route.type==="claim" 的任务
+   * 
+   * 用途2 - 集赞进度推进 (有token):
+   *   POST /task/claim { taskSpeType, token }
+   *   返回DONE但不推进集赞进度 (需原生桥)
    */
-  async claimTask(taskSpeType, token) {
-    return await this.taskCenter.post('/task/claim', { taskSpeType, token });
+  async claimTask(taskSpeType, token = '') {
+    const data = { taskSpeType };
+    if (token) data.token = token;
+    return await this.taskCenter.post('/task/claim', data);
   }
 
   /**
@@ -380,19 +409,42 @@ class PointsTaskExecutor {
         const reward = task.reward?.value || '?';
         const status = task.status;
 
-        if (!token) {
-          log(`  ⏭️ 跳过 [${title}]: 无token`);
-          skippedCount++;
-          continue;
-        }
-
         try {
+          let currentToken = token;
           let currentStatus = status;
+
+          // 步骤0: 如果无token且状态为Init, 先claim获取token
+          // 逆向发现: 无token任务的button.operation.route.type === "claim"
+          // 调用 /task/claim {taskSpeType} (无需token) → Init变Todo + 生成token
+          if (!currentToken && currentStatus === 'Init') {
+            try {
+              const claimResult = await this.client.claimTask(taskSpeType, '');
+              currentToken = claimResult?.token || '';
+              currentStatus = claimResult?.status || 'Todo';
+              log(`  📝 [${title}] claim → ${currentStatus}${currentToken ? ' (获取token)' : ''}`);
+              if (!currentToken) {
+                log(`  ⏭️ [${title}] claim后仍无token, 跳过`);
+                skippedCount++;
+                continue;
+              }
+            } catch (e) {
+              log(`  ⏭️ [${title}] claim失败: ${e.apiDesc || e.message}`);
+              skippedCount++;
+              continue;
+            }
+            await new Promise(r => setTimeout(r, 500));
+          }
+
+          if (!currentToken) {
+            log(`  ⏭️ 跳过 [${title}]: 无token`);
+            skippedCount++;
+            continue;
+          }
 
           // 步骤1: 如果是 Todo/Init 状态, 先 complete
           if (currentStatus === 'Todo' || currentStatus === 'Init') {
             try {
-              const completeResult = await this.client.completeTask(taskSpeType, token);
+              const completeResult = await this.client.completeTask(taskSpeType, currentToken);
               currentStatus = completeResult?.status || 'Award';
               log(`  📝 [${title}] complete → ${currentStatus}`);
             } catch (e) {
@@ -409,7 +461,7 @@ class PointsTaskExecutor {
 
           // 步骤2: 如果是 Award 状态, 领取奖励
           if (currentStatus === 'Award') {
-            const rewardResult = await this.client.rewardTask(taskSpeType, token);
+            const rewardResult = await this.client.rewardTask(taskSpeType, currentToken);
             const points = rewardResult?.rewarded?.value || 0;
             const tips = getLocalizedText(rewardResult?.rewarded?.desc?.tips) || `${points} 积分`;
             log(`  🎁 [${title}] 领取成功! +${tips}`);
@@ -418,7 +470,7 @@ class PointsTaskExecutor {
           }
           // 步骤3: 如果是 NeedConfirm 状态, 确认领奖
           else if (currentStatus === 'NeedConfirm') {
-            const confirmResult = await this.client.confirmTask(taskSpeType, token);
+            const confirmResult = await this.client.confirmTask(taskSpeType, currentToken);
             const points = confirmResult?.rewarded?.value || 0;
             const tips = getLocalizedText(confirmResult?.rewarded?.desc?.tips) || `${points} 积分`;
             log(`  🎁 [${title}] 确认成功! +${tips}`);
