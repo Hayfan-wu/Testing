@@ -17,13 +17,13 @@
   设备id     - 手机设备唯一标识（可通过抓包获取，任意字符串也可）
 
 其他配置（在脚本中手动修改）:
-  1. wtoken（第33行左右）: 需手动抓包获取，用于文章阅读/点赞/分享接口鉴权
+  1. wtoken: 需手动抓包获取，用于文章阅读/点赞/分享接口鉴权
+     - 通过环境变量 YONGPAI_WTOKEN 配置
      - 抓包方法: 使用抓包工具（如HttpCanary/Charles）抓取甬派App请求头中的 wtoken 值
-     - 填入: let wtoken = '抓到的wtoken值'
   2. Proxy_url（第31行左右）: 代理API地址，如不需要代理则留空
 
 依赖安装（Node.js环境）:
-  npm install got hpagent moment
+  npm install got hpagent
 
 WxPusher通知配置:
   1. 环境变量 WX_PUSHER_APP_TOKEN: WxPusher应用的appToken（在WxPusher后台创建应用获取）
@@ -37,7 +37,6 @@ WxPusher通知配置:
 */
 
 const $ = Env('甬派转盘')
-const moment = require('moment');
 const { HttpsProxyAgent } = require('hpagent')
 const got = require('got')
 const fs = require('fs');
@@ -50,7 +49,7 @@ let MODE = 0                    // 并发控制 1-并发  0-顺序
 // =============================================== 代理api ========================================================
 let Proxy_url = ''
 //=======================内置wtoken=================================================================================
-let wtoken = ''// 手动抓wtoken可1带10
+let wtoken = process.env.YONGPAI_WTOKEN || ''// 从环境变量 YONGPAI_WTOKEN 读取，手动抓wtoken可1带10
 
 // ================================ WxPusher通知配置 ========================================
 const WX_PUSHER_APP_TOKEN = process.env.WX_PUSHER_APP_TOKEN || ''  // WxPusher应用appToken
