@@ -36,6 +36,59 @@ class Env {
 }
 const $ = new Env("中国移动云盘云朵中心");
 
+// ======================== WxPusher 推送 ========================
+async function wxpusherPush(title, content, contentType = 1) {
+    if (!WXPUSHER_APP_TOKEN) return false;
+    if (WXPUSHER_UIDS.length === 0 && WXPUSHER_TOPIC_IDS.length === 0) return false;
+    try {
+        const payload = {
+            appToken: WXPUSHER_APP_TOKEN,
+            content: content,
+            summary: title,
+            contentType: contentType, // 1=文字 2=HTML 3=markdown
+            uids: WXPUSHER_UIDS,
+            topicIds: WXPUSHER_TOPIC_IDS,
+        };
+        const resp = await axios({
+            method: "POST",
+            url: "https://wxpusher.zjiecode.com/api/send/message",
+            headers: { "Content-Type": "application/json" },
+            data: payload,
+            timeout: 15000,
+            validateStatus: () => true,
+            httpsAgent,
+        });
+        if (resp.data?.success) {
+            $.log(`📨 WxPusher推送成功`);
+            return true;
+        }
+        $.log(`⚠️ WxPusher推送失败: ${resp.data?.msg || "未知错误"}`);
+        return false;
+    } catch (e) {
+        $.log(`⚠️ WxPusher推送异常: ${e.message}`);
+        return false;
+    }
+}
+
+// 生成HTML格式的推送内容
+function buildPushHtml(accountResults, taskDetails) {
+    let html = "";
+    for (const r of accountResults) {
+        html += `<p><b>📱 ${r.label}</b></p>`;
+        html += `<p>${r.summary.replace(/\|/g, '<br>')}</p>`;
+    }
+    if (taskDetails && taskDetails.length > 0) {
+        html += `<hr><p><b>📋 任务详情</b></p><ul>`;
+        for (const t of taskDetails) {
+            const icon = t.status === "FINISH" ? "✅" : (t.status === "WAIT" ? "⏳" : "❓");
+            html += `<li>${icon} ${t.name}: ${t.statusText}</li>`;
+        }
+        html += `</ul>`;
+    }
+    html += `<hr><p style="color:#999;font-size:12px;">${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}</p>`;
+    return html;
+}
+
 // ======================== 配置 ========================
 const MARKET_BASE = "https://m.mcloud.139.com";
 const CAIYUN_BASE = "https://caiyun.feixin.10086.cn";
@@ -58,6 +111,11 @@ const TOKENPK_MARKET_NAME = "National_TokenPK";
 const TOKENPK_SOURCE_ID = "1030";
 const TOKENPK_PRIZE_PAGE_URL = "https://m.mcloud.139.com/portal/cloudItem/index.html?path=getPrize&sourceid=1102";
 const TOKENPK_INVITE_CODE = "eb11f7338ef147c48b39d92ec14e75bd2008";
+
+// WxPusher 推送配置
+const WXPUSHER_APP_TOKEN = process.env.WXPUSHER_APP_TOKEN || "";
+const WXPUSHER_UIDS = (process.env.WXPUSHER_UIDS || "").split(/[,&\n]/).filter(Boolean);
+const WXPUSHER_TOPIC_IDS = (process.env.WXPUSHER_TOPIC_IDS || "").split(/[,&\n]/).filter(Boolean).map(Number).filter(Boolean);
 
 // 红包派对配置
 const RED_PACKET_BASE = "https://cpactiv.buy.139.com/cloudphone-market";
@@ -1103,17 +1161,6 @@ async function handleCloudV2Task(ctx, jwtToken, account, group, task) {
         return;
     }
 
-    // 任务434: 分享文件
-    if (taskId === 434) {
-        $.log(`  🎯 去完成: ${taskName}`);
-        const result = await completeShareFileTask(account, task);
-        const refreshed = await queryCloudTask(ctx, taskId, "month") || task;
-        if (refreshed.state === "FINISH") $.log(`  ✅ 已完成: ${stripTaskName(refreshed)}`);
-        else if (result) $.log(`  ✅ 分享成功: ${stripTaskName(refreshed)}${getTaskProgress(refreshed)}`);
-        else $.log(`  ⏳ 需手动完成: ${taskName}${getTaskProgress(refreshed)}`);
-        return;
-    }
-
     // 任务585: AI相机
     if (taskId === 585) {
         $.log(`  🎯 去完成: ${taskName}`);
@@ -1142,6 +1189,258 @@ async function handleCloudV2Task(ctx, jwtToken, account, group, task) {
         await completeNoticeTask(jwtToken, taskName);
         return;
     }
+
+    // ====== 增强任务处理: interfacecallback类任务 ======
+
+    // 任务472: 体验139邮箱 (email step)
+    if (taskId === 472) {
+        $.log(`  🎯 去完成: ${taskName}`);
+        const stepTypes = new Set(task.stepTypeSet || []);
+        for (const key of stepTypes) await clickTask(ctx, taskId, key);
+        await clickTask(ctx, taskId);
+        // 尝试邮箱相关API
+        try {
+            const emailStatus = await caiyunGet(jwtToken, "/market/emailStatus/currEmailStatus");
+            const emailOpened = emailStatus.data?.result || false;
+            $.log(`  📧 邮箱状态: ${emailOpened ? "已开启" : "未开启"}`);
+            // 尝试开启邮件备份
+            if (!emailOpened) {
+                const openR = await caiyunPost(jwtToken, "/market/email/openSmsSwitch", {});
+                if (openR.data?.code === 0) $.log(`  ✅ 开启邮件备份成功`);
+            }
+            // 访问日志上报
+            const formData = `module=uservisit&optkeyword=email_task_visit&sourceid=${MARKET_SOURCE_ID}&marketName=${ACTIVITY_ID}`;
+            await marketPostForm(ctx, "/ycloud/visitlog/journaling", formData).catch(() => {});
+            // 尝试回调API
+            const reportR = await marketPost(ctx, "/ycloud/signin/public/doMoveAppReport", { cToken: ctx.marketHeaders.jwtToken });
+            if (reportR.data?.code === 0) $.log(`  📨 邮箱行为已上报`);
+        } catch (e) {
+            $.log(`  ⚠️ 邮箱任务异常: ${e.message}`);
+        }
+        await sleep(1500);
+        const refreshed = await queryCloudTask(ctx, taskId, group) || task;
+        if (refreshed.state === "FINISH") $.log(`  ✅ 已完成: ${stripTaskName(refreshed)}`);
+        else $.log(`  ⏳ 需APP内体验139邮箱: ${stripTaskName(refreshed)}${getTaskProgress(refreshed)}`);
+        return;
+    }
+
+    // 任务447: 中国移动APP领好礼 (interfacecallback)
+    if (taskId === 447) {
+        $.log(`  🎯 去完成: ${taskName}`);
+        const stepTypes = new Set(task.stepTypeSet || []);
+        for (const key of stepTypes) await clickTask(ctx, taskId, key);
+        await clickTask(ctx, taskId);
+        // 尝试中国移动APP相关回调
+        try {
+            // doMoveAppReport - 模拟移动App上报
+            const reportR = await marketPost(ctx, "/ycloud/signin/public/doMoveAppReport", { cToken: ctx.ssoToken || ctx.marketHeaders.jwtToken });
+            if (reportR.data?.code === 0) $.log(`  📱 移动App行为已上报`);
+            // signInCallback - 尝试签到回调
+            const cbR = await marketPost(ctx, "/ycloud/signin/mobileApp/signInCallback", { taskToken: ctx.ssoToken || "" });
+            if (cbR.data?.code === 0) $.log(`  ✅ 签到回调成功`);
+            // 访问日志
+            const formData = `module=uservisit&optkeyword=cmcc_app_task&sourceid=${MARKET_SOURCE_ID}&marketName=${ACTIVITY_ID}`;
+            await marketPostForm(ctx, "/ycloud/visitlog/journaling", formData).catch(() => {});
+        } catch (e) {
+            $.log(`  ⚠️ 中国移动APP任务异常: ${e.message}`);
+        }
+        await sleep(1500);
+        const refreshed = await queryCloudTask(ctx, taskId, group) || task;
+        if (refreshed.state === "FINISH") $.log(`  ✅ 已完成: ${stripTaskName(refreshed)}`);
+        else $.log(`  ⏳ 需中国移动APP内完成: ${stripTaskName(refreshed)}${getTaskProgress(refreshed)}`);
+        return;
+    }
+
+    // 任务503: 和包APP签到兑话费 (interfacecallback)
+    if (taskId === 503) {
+        $.log(`  🎯 去完成: ${taskName}`);
+        const stepTypes = new Set(task.stepTypeSet || []);
+        for (const key of stepTypes) await clickTask(ctx, taskId, key);
+        await clickTask(ctx, taskId);
+        // 尝试和包相关回调API
+        try {
+            // heBaoReport - 和包上报
+            const hebaoR = await marketPost(ctx, "/ycloud/signin/public/heBaoReport", { noticeToken: ctx.ssoToken || "" });
+            if (hebaoR.data?.code === 0) $.log(`  🎒 和包行为已上报 (code=0)`);
+            else if (hebaoR.data) $.log(`  ⚠️ 和包上报: ${hebaoR.data.msg || JSON.stringify(hebaoR.data).slice(0,80)}`);
+            // doMoveAppReport - 备用
+            const reportR = await marketPost(ctx, "/ycloud/signin/public/doMoveAppReport", { cToken: ctx.ssoToken || "" });
+            if (reportR.data?.code === 0) $.log(`  📱 移动App行为已上报 (备用)`);
+            // 访问和包页面 (尝试触发回调)
+            await axios({
+                method: "GET",
+                url: "https://p.10086.cn/waph5/single/callHebao?TAGPAG=5524&MERCSIGN=27IHGZBdOAdYrvbkLHNdEH7VNYsB6jf5&hebaoext=",
+                headers: { "User-Agent": USER_AGENT, "Accept": "text/html" },
+                timeout: 10000, validateStatus: () => true, httpsAgent,
+            }).catch(() => {});
+            // 访问日志
+            const formData = `module=uservisit&optkeyword=hebao_signin&sourceid=${MARKET_SOURCE_ID}&marketName=${ACTIVITY_ID}`;
+            await marketPostForm(ctx, "/ycloud/visitlog/journaling", formData).catch(() => {});
+        } catch (e) {
+            $.log(`  ⚠️ 和包任务异常: ${e.message}`);
+        }
+        await sleep(2000);
+        const refreshed = await queryCloudTask(ctx, taskId, group) || task;
+        if (refreshed.state === "FINISH") $.log(`  ✅ 已完成: ${stripTaskName(refreshed)}`);
+        else $.log(`  ⏳ 需和包APP内签到: ${stripTaskName(refreshed)}${getTaskProgress(refreshed)}`);
+        return;
+    }
+
+    // 任务105: 绑定公众号 (wechatbinding)
+    if (taskId === 105) {
+        $.log(`  🎯 去完成: ${taskName}`);
+        const stepTypes = new Set(task.stepTypeSet || []);
+        for (const key of stepTypes) await clickTask(ctx, taskId, key);
+        await clickTask(ctx, taskId);
+        // 尝试微信相关API
+        try {
+            // 获取微信JS-SDK签名
+            const wechatR = await marketPost(ctx, "/ycloud/wechat/share", {}, { "Content-Type": "application/json" });
+            if (wechatR.data?.code === 0 || wechatR.data?.success) {
+                $.log(`  💬 微信JS-SDK签名获取成功`);
+            }
+            // doMoveAppReport - 尝试回调
+            const reportR = await marketPost(ctx, "/ycloud/signin/public/doMoveAppReport", { cToken: ctx.ssoToken || "" });
+            if (reportR.data?.code === 0) $.log(`  📱 移动App行为已上报`);
+            // 访问日志
+            const formData = `module=uservisit&optkeyword=wechat_bind_task&sourceid=${MARKET_SOURCE_ID}&marketName=${ACTIVITY_ID}`;
+            await marketPostForm(ctx, "/ycloud/visitlog/journaling", formData).catch(() => {});
+        } catch (e) {
+            $.log(`  ⚠️ 公众号任务异常: ${e.message}`);
+        }
+        await sleep(1500);
+        const refreshed = await queryCloudTask(ctx, taskId, group) || task;
+        if (refreshed.state === "FINISH") $.log(`  ✅ 已完成: ${stripTaskName(refreshed)}`);
+        else $.log(`  ⏳ 需微信绑定公众号: ${stripTaskName(refreshed)}${getTaskProgress(refreshed)}`);
+        return;
+    }
+
+    // 任务113: 使用PC客户端 (nda step)
+    if (taskId === 113) {
+        $.log(`  🎯 去完成: ${taskName}`);
+        const stepTypes = new Set(task.stepTypeSet || []);
+        for (const key of stepTypes) await clickTask(ctx, taskId, key);
+        await clickTask(ctx, taskId);
+        // 尝试模拟PC客户端上传
+        try {
+            const deviceId = ctx.deviceId || "";
+            const cleanDeviceId = deviceId.replace(/^B/, "");
+            const pcFileName = `pc_auto_${Date.now()}.txt`;
+            // 模拟PC端创建文件 (使用PC格式headers)
+            const pcHeaders = {
+                "Connection": "keep-alive",
+                "sec-ch-ua-platform": '"Windows"',
+                "Authorization": account.authorization,
+                "x-yun-api-version": "v1",
+                "x-yun-tid": generateUUID(),
+                "sec-ch-ua": '"Not A(Brand";v="8", "Chromium";v="130"',
+                "sec-ch-ua-mobile": "?0",
+                "X-Requested-With": "com.chinamobile.mcloud",
+                "Origin": "https://frontend.mcloud.139.com",
+                "Referer": "https://frontend.mcloud.139.com/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json",
+                "x-yun-client-info": `4||0|${CLIENT_VERSION}|Microsoft|Windows|${cleanDeviceId}|Windows 10|||||`,
+                "x-yun-app-channel": "101",
+            };
+            // 快速上传(秒传)
+            const rapidResp = await axios({
+                method: "POST",
+                url: `${CLOUD_FILE_BASE}/orchestration/personalCloud-rebuild/pcsfile/v1.0/rapidUpload`,
+                headers: pcHeaders,
+                data: {
+                    rapidUploadReq: {
+                        contentLength: DUMMY_CONTENT.length,
+                        eTag: DUMMY_HASH,
+                        fileSize: DUMMY_CONTENT.length,
+                        operationType: 1,
+                        parentId: "root",
+                        path: "",
+                        serverEpFileId: "",
+                        sizeRange: 2,
+                        type: 1,
+                        uploadFileTotal: 1,
+                        fileName: pcFileName,
+                        commonAccountInfo: { account: account.phone, accountType: 1 },
+                    },
+                },
+                timeout: 15000, validateStatus: () => true, httpsAgent,
+            });
+            const rapidData = rapidResp.data || {};
+            if (rapidData.success || rapidData.code === "0" || String(rapidData.code) === "0") {
+                $.log(`  💻 PC端文件创建成功 (秒传)`);
+                // 尝试commit
+                const fileId = rapidData.data?.fileID || rapidData.data?.result?.fileID || "";
+                if (fileId) {
+                    const commitResp = await axios({
+                        method: "POST",
+                        url: `${CLOUD_FILE_BASE}/orchestration/personalCloud-rebuild/pcsfile/v1.0/commit`,
+                        headers: pcHeaders,
+                        data: {
+                            commitReq: {
+                                contentLength: DUMMY_CONTENT.length,
+                                fileVersion: 1,
+                                opType: 1,
+                                partNumber: 1,
+                                serverEpFileId: fileId,
+                                totalSize: DUMMY_CONTENT.length,
+                                uploadResult: [
+                                    { eTag: DUMMY_HASH, partNumber: 1, partSize: DUMMY_CONTENT.length, success: true },
+                                ],
+                                commonAccountInfo: { account: account.phone, accountType: 1 },
+                            },
+                        },
+                        timeout: 15000, validateStatus: () => true, httpsAgent,
+                    });
+                    if (commitResp.data?.success || commitResp.data?.code === "0") {
+                        $.log(`  ✅ PC端文件commit成功`);
+                    } else {
+                        $.log(`  ⚠️ PC端commit结果: ${JSON.stringify(commitResp.data).slice(0, 100)}`);
+                    }
+                    // 清理文件
+                    await trashCloudFiles(account, [fileId]).catch(() => {});
+                }
+            } else {
+                $.log(`  ⚠️ PC端文件创建: ${rapidData.message || rapidData.msg || "未知结果"}`);
+            }
+            // 访问日志
+            const formData = `module=uservisit&optkeyword=pc_client_task&sourceid=${MARKET_SOURCE_ID}&marketName=${ACTIVITY_ID}`;
+            await marketPostForm(ctx, "/ycloud/visitlog/journaling", formData).catch(() => {});
+        } catch (e) {
+            $.log(`  ⚠️ PC客户端任务异常: ${e.message}`);
+        }
+        await sleep(2000);
+        const refreshed = await queryCloudTask(ctx, taskId, group) || task;
+        if (refreshed.state === "FINISH") $.log(`  ✅ 已完成: ${stripTaskName(refreshed)}`);
+        else $.log(`  ⏳ 需PC客户端登录: ${stripTaskName(refreshed)}${getTaskProgress(refreshed)}`);
+        return;
+    }
+
+    // 任务434: 分享文件领好礼 (增强版 - 含进度计算)
+    if (taskId === 434) {
+        $.log(`  🎯 去完成: ${taskName}`);
+        const stepTypes = new Set(task.stepTypeSet || []);
+        for (const key of stepTypes) await clickTask(ctx, taskId, key);
+        await clickTask(ctx, taskId);
+        // 执行分享
+        const result = await completeShareFileTask(account, task);
+        await sleep(2000);
+        const refreshed = await queryCloudTask(ctx, taskId, "month") || task;
+        // 计算分享天数进度 (currstep为位图)
+        const currstep = parseInt(refreshed.currstep || 0);
+        let daysDone = 0;
+        for (let i = 0; i < 7; i++) { if ((currstep >> i) & 1) daysDone++; }
+        if (refreshed.state === "FINISH") {
+            $.log(`  ✅ 已完成: ${stripTaskName(refreshed)}`);
+        } else if (result) {
+            $.log(`  ✅ 今日分享成功: ${stripTaskName(refreshed)} (已分享${daysDone}/3天, 7天内累计3天完成)`);
+        } else {
+            $.log(`  ⏳ 需APP内分享: ${stripTaskName(refreshed)} (已分享${daysDone}/3天, 7天内累计3天完成)`);
+        }
+        return;
+    }
+
+    // ====== 增强任务处理结束 ======
 
     // 通用点击任务
     const clickKeys = getTaskClickKeys(task);
@@ -1988,14 +2287,98 @@ async function receiveCloud(ctx, jwtToken) {
     }
     const pending = info.result.toReceive || 0;
     const total = info.result.total || 0;
-    if (pending > 0) {
-        $.log(`☁️ 待领取: ${pending}云朵, 领取中...`);
-        const receiveHeaders = { ...ctx.marketHeaders, showLoading: "true", appVersion: `${CLIENT_VERSION}.0`, activityId: ACTIVITY_ID };
+    const receiveList = info.result.receiveList || [];
+
+    if (pending === 0) {
+        $.log(`☁️ 当前待领取: 0云朵, 总计: ${total}云朵`);
+        return { received: 0, total };
+    }
+
+    $.log(`☁️ 待领取: ${pending}云朵 (${receiveList.length}项), 领取中...`);
+    let totalReceived = 0;
+    let currentTotal = total;
+
+    // 策略1: 逐个领取 (使用 recordId 作为 cloudId，避免分布式锁冲突)
+    if (receiveList.length > 0) {
+        $.log(`  📋 逐个领取 ${receiveList.length} 项奖励...`);
+        for (let i = 0; i < receiveList.length; i++) {
+            const item = receiveList[i];
+            const recordId = item.recordId || item.id || "";
+            const cloudNum = item.cloudNum || 0;
+            if (!recordId) continue;
+
+            // 最多重试2次
+            let success = false;
+            for (let retry = 0; retry < 2 && !success; retry++) {
+                try {
+                    const resp = await axios({
+                        method: "GET",
+                        url: `${MARKET_BASE}/ycloud/signin/page/receiveV2`,
+                        headers: {
+                            ...ctx.marketHeaders,
+                            showLoading: "true",
+                            appVersion: `${CLIENT_VERSION}.0`,
+                            activityId: ACTIVITY_ID,
+                        },
+                        params: { client: "app", cloudId: String(recordId) },
+                        timeout: 15000, validateStatus: () => true, decompress: true, httpsAgent,
+                    });
+                    let data = resp.data;
+                    if (typeof data === "string") { try { data = JSON.parse(data); } catch (e) {} }
+                    if (data?.code === 0) {
+                        const received = data.result?.receive || cloudNum;
+                        totalReceived += received;
+                        currentTotal = data.result?.total || (currentTotal + received);
+                        $.log(`    ✅ 第${i+1}项 +${received}云朵 (recordId=${recordId})`);
+                        success = true;
+                    } else if (data?.code === 614) {
+                        // 锁定失败，等待后重试
+                        if (retry === 0) {
+                            $.log(`    ⚠️ 第${i+1}项 锁定失败，1秒后重试...`);
+                            await sleep(1000);
+                        } else {
+                            $.log(`    ❌ 第${i+1}项 领取失败: ${data?.msg || "未知错误"}`);
+                        }
+                    } else {
+                        $.log(`    ❌ 第${i+1}项 失败: code=${data?.code} ${data?.msg || ""}`);
+                        break; // 非锁定错误，不重试
+                    }
+                } catch (e) {
+                    $.log(`    ❌ 第${i+1}项 异常: ${e.message}`);
+                    break;
+                }
+            }
+            await sleep(500);
+        }
+
+        // 如果有成功领取，重新查询状态
+        if (totalReceived > 0) {
+            const latestInfo = await getPageInfo(ctx);
+            if (latestInfo?.result) {
+                currentTotal = latestInfo.result.total || currentTotal;
+                const latestPending = latestInfo.result.toReceive || 0;
+                if (latestPending === 0) {
+                    $.log(`✅ 全部领取成功: +${totalReceived}云朵, 总计: ${currentTotal}云朵`);
+                    return { received: totalReceived, total: currentTotal };
+                }
+                // 还有剩余，继续尝试批量领取
+                $.log(`  📦 逐个领取完成: +${totalReceived}云朵, 剩余 ${latestPending} 云朵，尝试批量领取...`);
+            }
+        }
+    }
+
+    // 策略2: 批量领取 (receiveV2)
+    if (totalReceived === 0 || (info.result.toReceive || 0) > totalReceived) {
         try {
             const resp = await axios({
                 method: "GET",
                 url: `${MARKET_BASE}/market/signin/page/receiveV2`,
-                headers: receiveHeaders,
+                headers: {
+                    ...ctx.marketHeaders,
+                    showLoading: "true",
+                    appVersion: `${CLIENT_VERSION}.0`,
+                    activityId: ACTIVITY_ID,
+                },
                 params: { client: "app" },
                 timeout: 15000, validateStatus: () => true, decompress: true, httpsAgent,
             });
@@ -2004,42 +2387,60 @@ async function receiveCloud(ctx, jwtToken) {
             if (data?.code === 0) {
                 const received = data.result?.receive || pending;
                 const newTotal = data.result?.total || total;
-                $.log(`✅ 领取云朵: ${received}云朵, 总计: ${newTotal}云朵`);
-                return { received, total: newTotal };
+                totalReceived = Math.max(totalReceived, received);
+                currentTotal = newTotal;
+                $.log(`✅ 批量领取成功: ${received}云朵, 总计: ${newTotal}云朵`);
+                return { received: totalReceived, total: currentTotal };
             }
-            const latestInfo = await getPageInfo(ctx);
-            if (latestInfo?.result) {
-                const latestTotal = latestInfo.result.total || total;
-                const latestPending = latestInfo.result.toReceive || 0;
-                if (latestPending === 0 || latestTotal > total) {
-                    $.log(`✅ 领取云朵成功, 总计: ${latestTotal}云朵`);
-                    return { received: pending, total: latestTotal };
-                }
-            }
-            $.log(`⚠️ 领取失败: ${data?.msg || "未知错误"}, 待领取: ${pending}云朵`);
         } catch (e) {
-            $.log(`⚠️ 领取异常: ${e.message}`);
+            $.log(`⚠️ 批量领取异常: ${e.message}`);
         }
-    } else {
-        $.log(`☁️ 当前待领取: 0云朵, 总计: ${total}云朵`);
     }
-    return { received: 0, total };
+
+    // 最终校验
+    const latestInfo = await getPageInfo(ctx);
+    if (latestInfo?.result) {
+        const latestTotal = latestInfo.result.total || currentTotal;
+        const latestPending = latestInfo.result.toReceive || 0;
+        if (latestPending === 0 || latestTotal > total) {
+            const finalReceived = latestTotal - total;
+            $.log(`✅ 领取完成, 总计: ${latestTotal}云朵`);
+            return { received: Math.max(totalReceived, finalReceived), total: latestTotal };
+        }
+    }
+
+    if (totalReceived > 0) {
+        $.log(`✅ 部分领取: +${totalReceived}云朵, 总计: ${currentTotal}云朵`);
+        return { received: totalReceived, total: currentTotal };
+    }
+    $.log(`⚠️ 领取失败: 活动太火爆，稍后再试, 待领取: ${pending}云朵`);
+    return { received: 0, total: currentTotal };
 }
 
 // ======================== 最终状态检查 ========================
 async function recheckTasks(ctx) {
     let finished = 0, waiting = 0;
     const waitingTasks = [];
+    const taskDetails = [];
     for (const [group, title] of getCloudTaskGroups()) {
         const tasks = await getTaskListV2(ctx, group);
         for (const t of tasks) {
-            if (t.state === "FINISH") finished++;
-            else { waiting++; waitingTasks.push(`${t.id}(${stripTaskName(t)})`); }
+            const name = stripTaskName(t);
+            const status = t.state || "WAIT";
+            const progress = getTaskProgress(t);
+            if (status === "FINISH") {
+                finished++;
+                taskDetails.push({ id: t.id, name, status, statusText: "已完成" + progress });
+            } else {
+                waiting++;
+                waitingTasks.push(`${t.id}(${name})`);
+                taskDetails.push({ id: t.id, name, status, statusText: "未完成" + progress });
+            }
         }
     }
     $.log(`\n📊 任务最终状态: ✅${finished}已完成 / ⏳${waiting}未完成`);
     if (waitingTasks.length > 0) $.log(`   未完成: ${waitingTasks.join(", ")}`);
-    return { finished, waiting };
+    return { finished, waiting, taskDetails };
 }
 
 // ======================== 单账号执行 ========================
@@ -2050,6 +2451,9 @@ async function runForAccount(account, index) {
     $.log(`   手机号: ${account.phone}`);
     $.log(`${"=".repeat(50)}`);
     let summary = `${label}: `;
+    let taskDetails = [];
+    let cloudInfo = null;
+    let click319Result = 0;
 
     // 1. 认证
     checkAuthExpiry(account.authorization);
@@ -2057,18 +2461,19 @@ async function runForAccount(account, index) {
     const ssoToken = await getSsoToken(account);
     if (!ssoToken) {
         $.logErr(`❌ ${label} 认证失败`);
-        return `${label}: 认证失败`;
+        return { label, summary: `${label}: 认证失败`, taskDetails: [], success: false };
     }
     $.log("【认证】获取 jwtToken...");
     const jwtToken = await getJwtToken(ssoToken);
     if (!jwtToken) {
         $.logErr(`❌ ${label} 认证失败`);
-        return `${label}: 认证失败`;
+        return { label, summary: `${label}: 认证失败`, taskDetails: [], success: false };
     }
     $.log("✅ 认证成功");
 
     // 2. 构建 market context (含设备指纹获取)
     const ctx = await buildMarketContext(jwtToken, ssoToken, account);
+    ctx.ssoToken = ssoToken; // 保存ssoToken供任务回调使用
     $.log(`🔧 userDomainId: ${ctx.userDomainId || "无"}`);
 
     try {
@@ -2094,7 +2499,7 @@ async function runForAccount(account, index) {
 
         // 5. 戳一戳
         $.log("\n【3/9】戳一戳");
-        const click319Result = await click319(ctx);
+        click319Result = await click319(ctx);
         await randomDelay(500, 1000);
 
         // 6. 任务列表
@@ -2119,7 +2524,7 @@ async function runForAccount(account, index) {
 
         // 10. 领取云朵
         $.log("\n【8/9】领取云朵");
-        const cloudInfo = await receiveCloud(ctx, jwtToken);
+        cloudInfo = await receiveCloud(ctx, jwtToken);
         await randomDelay(500, 1000);
 
         // 11. 红包派对
@@ -2130,23 +2535,24 @@ async function runForAccount(account, index) {
         // 最终状态检查
         $.log("\n【检查】最终任务状态");
         const finalStatus = await recheckTasks(ctx);
+        taskDetails = finalStatus.taskDetails || [];
 
         summary += `任务:✅${finalStatus.finished}/⏳${finalStatus.waiting} | 戳:${click319Result}次`;
         if (cloudInfo) summary += ` | 云朵:${cloudInfo.total}`;
 
         $.log(`\n📊 ${label} 结果: ${summary}`);
-        return summary;
+        return { label, summary, taskDetails, cloudInfo, click319Result, success: true };
     } catch (e) {
         $.logErr(`❌ ${label} 异常: ${e.message}`);
         $.logErr(e.stack);
-        return `${label}: 异常(${e.message})`;
+        return { label, summary: `${label}: 异常(${e.message})`, taskDetails: [], success: false };
     }
 }
 
 // ======================== 主流程 ========================
 async function main() {
     $.log("=".repeat(50));
-    $.log("🚀 中国移动云盘 · 云朵中心 v3.0 (参照ydyp v5.0.10)");
+    $.log("🚀 中国移动云盘 · 云朵中心 v3.1 (增强版 + WxPusher推送)");
     $.log("=".repeat(50));
 
     const rawToken = process.env.MCLOUD_TOKEN || "";
@@ -2156,12 +2562,18 @@ async function main() {
         $.log("💡 获取: 抓包 orches.yun.139.com 请求头 Authorization");
         $.log("💡 多账号用 & 或换行分隔");
         $.notify("中国移动云盘", "❌ 未配置", "MCLOUD_TOKEN 为空");
+        await wxpusherPush("❌ 移动云盘脚本未配置", "MCLOUD_TOKEN 环境变量为空，请检查配置。");
         return;
     }
 
     const tokenList = splitAccounts(rawToken);
     $.log(`📋 检测到 ${tokenList.length} 个账号`);
     $.log(`🔧 deviceId获取顺序: 设备指纹接口 → 环境变量 → 本地缓存 → 自动生成`);
+    if (WXPUSHER_APP_TOKEN && (WXPUSHER_UIDS.length > 0 || WXPUSHER_TOPIC_IDS.length > 0)) {
+        $.log(`📨 WxPusher推送: 已启用 (${WXPUSHER_UIDS.length}个UID, ${WXPUSHER_TOPIC_IDS.length}个主题)`);
+    } else {
+        $.log(`📨 WxPusher推送: 未配置 (设置 WXPUSHER_APP_TOKEN + WXPUSHER_UIDS 启用)`);
+    }
 
     const accounts = [];
     for (const ts of tokenList) {
@@ -2173,26 +2585,38 @@ async function main() {
     if (!accounts.length) {
         $.log("❌ 无有效账号");
         $.notify("中国移动云盘", "❌ 解析失败", "请检查 MCLOUD_TOKEN 格式");
+        await wxpusherPush("❌ 移动云盘账号解析失败", "请检查 MCLOUD_TOKEN 环境变量格式是否正确。");
         return;
     }
     $.log("");
 
     const results = [];
+    const allTaskDetails = [];
     for (let i = 0; i < accounts.length; i++) {
-        results.push(await runForAccount(accounts[i], i));
+        const result = await runForAccount(accounts[i], i);
+        results.push(result);
+        if (result.taskDetails && result.taskDetails.length > 0) {
+            allTaskDetails.push(...result.taskDetails);
+        }
         if (i < accounts.length - 1) await sleep(2000);
     }
 
-    const finalSummary = results.join("\n");
+    const finalSummary = results.map(r => r.summary).join("\n");
     $.log("\n" + "=".repeat(50));
     $.log("📊 全部执行完毕");
     $.log("=".repeat(50));
     $.log(finalSummary);
     $.log("=".repeat(50));
     $.notify("中国移动云盘", `✅ ${accounts.length}个账号执行完毕`, finalSummary);
+
+    // WxPusher推送
+    const pushTitle = `移动云盘`;
+    const pushHtml = buildPushHtml(results, allTaskDetails);
+    await wxpusherPush(pushTitle, pushHtml, 2); // contentType=2 表示HTML
 }
 
 main().catch(e => {
     $.logErr(`脚本异常: ${e.message}`);
     $.logErr(e.stack);
+    wxpusherPush("❌ 移动云盘脚本异常", `脚本执行异常: ${e.message}\n\n${e.stack || ""}`).catch(() => {});
 }).finally(() => $.done());
